@@ -53,7 +53,7 @@ def merge_videos(input_folder, output_folder):
         if file_name.endswith(('.mp4', '.avi', '.mov')) and not file_name.startswith('2024110608'):  # 检查文件扩展名
             key = file_name[:8]  # 获取文件名前8个字符
             current_date = datetime.strptime(key, "%Y%m%d")
-            if key not in exist_videos_dict and max_date not None and current_date > max_date:
+            if key not in exist_videos_dict and max_date is not None and current_date > max_date:
                 video_path = os.path.join(input_folder, file_name)
                 logging.info(f"Found video {file_name} with prefix {key}")
                 if key in videos_dict:
