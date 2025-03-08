@@ -24,7 +24,7 @@
 # Docker
 https://hub.docker.com/repository/docker/shengsheng123/xiaomi-camera-merge-tool-x86/general
 
-```docker pull shengsheng123/xiaomi-camera-merge-tool-x86```
+```docker pull shengsheng123/xiaomi-camera-merge-tool-x86:1.0```
 ## NAS(飞牛举例)
 将录像文件的存储路径映射到容器的 /app/input, 将合并后的视频保存路径映射到容器的 /app/output
 
