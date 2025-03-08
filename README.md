@@ -20,3 +20,12 @@
 
 合并后，将十几分钟一个的小视频合并为以天为一个视频进行保存按天保存（我是小米智能摄像头3pro，3k分辨率，每天的视频大小大约9个G）
 ![合并后的文件结构](https://github.com/Mrhs121/xiaomi-camera-merge-tool/blob/main/Snipaste_2025-03-01_20-25-31.png)
+
+# Docker
+https://hub.docker.com/repository/docker/shengsheng123/xiaomi-camera-merge-tool-x86/general
+
+```docker pull shengsheng123/xiaomi-camera-merge-tool-x86```
+## NAS(飞牛举例)
+将录像文件的存储路径映射到容器的 /app/input, 将合并后的视频保存路径映射到容器的 /app/output
+
+![飞牛](https://github.com/Mrhs121/xiaomi-camera-merge-tool/blob/main/%E6%88%AA%E5%B1%8F2025-03-08%2013.15.05.png)
