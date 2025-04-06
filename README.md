@@ -31,3 +31,13 @@ https://hub.docker.com/repository/docker/shengsheng123/xiaomi-camera-merge-tool-
 将录像文件的存储路径映射到容器的 /app/input, 将合并后的视频保存路径映射到容器的 /app/output
 
 ![飞牛](https://github.com/Mrhs121/xiaomi-camera-merge-tool/blob/main/%E6%88%AA%E5%B1%8F2025-03-08%2013.15.05.png)
+
+
+## v2 镜像新增参数 --delete-old-videos，默认为false，指定后会删除output中一周前的旧文件
+推荐如下使用姿势的同学开启此参数：
+output路径为ssd盘上的一个临时文件夹，每天定时任务再冷备份到hdd盘，这样就可以在合并的时候把ssd临时文件夹中的老文件删除了
+#### NAS开启此参数(飞牛举例)
+<img width="683" alt="截屏2025-04-06 21 42 16" src="https://github.com/user-attachments/assets/464b3497-aa22-4ebf-84e0-592b6136062a" />
+
+
+
