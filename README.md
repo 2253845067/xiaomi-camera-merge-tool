@@ -1,6 +1,13 @@
 # xiaomi-camera-merge-tool
 新款小米摄像头录像文件合并工具，将十几分钟一个的小视频合并为以天为一个视频进行保存按天保存
 
+oldmi_merge_daily_ffmepg.py ：适用于以下存储格式的老款摄像头，如下：
+<img width="307" alt="截屏2025-04-11 01 09 20" src="https://github.com/user-attachments/assets/c15b10bc-2622-4d4c-bac9-b13768feeafe" />
+
+merge_daily_ffmepg.py ：适用于以下存储格式的新款摄像头，如下：
+![小米摄像头文件结构](https://github.com/Mrhs121/xiaomi-camera-merge-tool/blob/main/Snipaste_2025-03-01_20-24-22.png)
+
+
 # 必要软件
 非docker环境需要提前准备好ffmpeg以及python
 
