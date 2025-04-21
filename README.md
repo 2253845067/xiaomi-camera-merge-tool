@@ -29,6 +29,7 @@ merge_daily_ffmepg.py ：适用于以下存储格式的新款摄像头，如下�
 ![合并后的文件结构](https://github.com/Mrhs121/xiaomi-camera-merge-tool/blob/main/Snipaste_2025-03-01_20-25-31.png)
 
 # Docker
+**目前docker镜像只适配了新款摄像头的存储格式**
 https://hub.docker.com/repository/docker/shengsheng123/xiaomi-camera-merge-tool-x86/general
 
 ```docker pull shengsheng123/xiaomi-camera-merge-tool-x86:1.0```
