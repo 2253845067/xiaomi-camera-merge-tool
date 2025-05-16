@@ -13,9 +13,14 @@ def merge_videos(input_path, output_path):
     # 按日期分组存储视频文件
     daily_videos = defaultdict(list)
 
+    # 获取今天的日期
+    today = datetime.now().strftime("%Y%m%d")
+
     # 遍历输入路径中的所有文件夹
     for folder_name in os.listdir(input_path):
         folder_path = os.path.join(input_path, folder_name)
+
+        # 确保是文件夹
         if os.path.isdir(folder_path):
             try:
                 # 解析文件夹名称，提取日期和小时
@@ -24,6 +29,11 @@ def merge_videos(input_path, output_path):
             except ValueError:
                 # 如果文件夹名称不符合格式，跳过
                 print(f"Skipping invalid folder name: {folder_name}")
+                continue
+
+            # 跳过今天的视频
+            if date_str == today:
+                print(f"Skipping today's folder: {folder_name}")
                 continue
 
             # 获取该文件夹内所有视频文件
