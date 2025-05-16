@@ -16,8 +16,6 @@ def merge_videos(input_path, output_path):
     # 遍历输入路径中的所有文件夹
     for folder_name in os.listdir(input_path):
         folder_path = os.path.join(input_path, folder_name)
-
-        # 确保是文件夹
         if os.path.isdir(folder_path):
             try:
                 # 解析文件夹名称，提取日期和小时
