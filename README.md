@@ -48,6 +48,9 @@ output路径为ssd盘上的一个临时文件夹，每天定时任务再冷备�
 需要在命令中填写 ```--old-cam``` 参数
 #### NAS开启此参数(飞牛举例)
 
+<img width="683" alt="截屏2025-04-06 21 42 16" src="[https://github.com/user-attachments/assets/464b3497-aa22-4ebf-84e0-592b6136062a](https://github.com/Mrhs121/xiaomi-camera-merge-tool/blob/main/%E6%88%AA%E5%B1%8F2025-05-16%2011.01.16.png)" />
+
+
 ## 2.0
 ``` docker pull shengsheng123/xiaomi-camera-merge-tool-x86:2.0 ```
 
