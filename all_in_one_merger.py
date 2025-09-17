@@ -3,12 +3,243 @@ import logging
 import os
 import re
 import subprocess
+import json
+import glob
 from datetime import datetime, timedelta
 from collections import defaultdict
 
 # 设置日志配置为INFO级别
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
+# ---- 大小与压缩相关工具 ----
+MAX_BYTES_5G = 5 * 1024**3  # 5GB（二进制，若想十进制请改为 5_000_000_000）
+
+def _get_duration_seconds(path):
+    """用 ffprobe 读时长（秒）。"""
+    try:
+        out = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=noprint_wrappers=1:nokey=1", path],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=True
+        ).stdout.strip()
+        return float(out)
+    except Exception as e:
+        logging.error(f"ffprobe 获取时长失败: {e}")
+        return None
+
+def _get_audio_bitrate_kbps_sum(path):
+    """
+    返回所有音频轨道的总码率（Kbps）。若无法读取（VBR 无 bit_rate 等），返回 None。
+    """
+    try:
+        out = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "a",
+             "-show_entries", "stream=bit_rate", "-of", "json", path],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=True
+        ).stdout
+        data = json.loads(out)
+        streams = data.get("streams", [])
+        total = 0
+        valid = False
+        for s in streams:
+            br = s.get("bit_rate")
+            if br is not None:
+                try:
+                    br_int = int(br)
+                    if br_int > 0:
+                        total += br_int
+                        valid = True
+                except Exception:
+                    pass
+        if valid:
+            return int(total / 1000)  # 转 Kbps
+        return None
+    except Exception as e:
+        logging.warning(f"无法读取音频码率（可能是VBR）：{e}")
+        return None
+
+def _cleanup_pass_logs(log_prefix):
+    """清理两遍编码的日志文件。"""
+    for f in glob.glob(f"{log_prefix}*"):
+        try:
+            os.remove(f)
+        except Exception:
+            pass
+
+def _two_pass_reencode_keep_audio(src, dst_tmp, video_kbps, passlog_prefix):
+    """
+    两遍编码，仅重压视频（libx264），音频不动（copy）。
+    第一遍丢弃输出到空设备。
+    """
+    devnull = os.devnull
+    # pass 1
+    cmd1 = [
+        "ffmpeg", "-y", "-i", src,
+        "-c:v", "libx264", "-b:v", f"{video_kbps}k",
+        "-pass", "1", "-preset", "medium", "-an",
+        "-f", "mp4", "-passlogfile", passlog_prefix, devnull
+    ]
+    # pass 2
+    cmd2 = [
+        "ffmpeg", "-y", "-i", src,
+        "-c:v", "libx264", "-b:v", f"{video_kbps}k",
+        "-pass", "2", "-preset", "medium",
+        "-c:a", "copy",
+        "-movflags", "+faststart",
+        "-passlogfile", passlog_prefix, dst_tmp
+    ]
+    logging.info(f"[2-pass] 视频码率={video_kbps}k，音频copy")
+    subprocess.run(cmd1, check=True)
+    subprocess.run(cmd2, check=True)
+    _cleanup_pass_logs(passlog_prefix)
+
+def _iterative_crf_keep_audio(src, dst_tmp, max_bytes, start_crf=23, step=2, max_crf=35):
+    """
+    迭代 CRF，在不改动音频的情况下寻找小于 max_bytes 的体积。
+    返回 (是否成功, 最终生成文件大小)
+    """
+    crf = start_crf
+    best_size = None
+    best_path = None
+
+    while crf <= max_crf:
+        try:
+            logging.info(f"[CRF迭代] 尝试 CRF={crf}（音频copy）")
+            subprocess.run([
+                "ffmpeg", "-y", "-i", src,
+                "-c:v", "libx264", "-crf", str(crf), "-preset", "medium",
+                "-c:a", "copy",
+                "-movflags", "+faststart",
+                dst_tmp
+            ], check=True)
+            size_now = os.path.getsize(dst_tmp)
+            if best_size is None or size_now < best_size:
+                best_size = size_now
+            if size_now <= max_bytes:
+                return True, size_now
+            # 未达标，增大 CRF 继续
+            crf += step
+        except subprocess.CalledProcessError as e:
+            logging.warning(f"CRF={crf} 失败: {e}")
+            crf += step
+
+    return False, best_size if best_size is not None else 0
+
+def compress_if_needed(path, max_bytes=MAX_BYTES_5G, safety=0.95, min_video_kbps=300, max_retries=2):
+    """
+    若文件超过 max_bytes，就在不动音频的前提下压缩：
+    1) 能读取音频总码率 -> 用两遍码率法精确控体积（更接近目标大小）
+    2) 否则退化为 CRF 迭代（音频copy）
+
+    safety: 安全系数，防止容器开销导致略超
+    max_retries: 2-pass 若首次仍略超，继续递减码率重试的次数
+    """
+    try:
+        size = os.path.getsize(path)
+    except FileNotFoundError:
+        logging.error(f"文件不存在，无法压缩: {path}")
+        return
+
+    if size <= max_bytes:
+        logging.info(f"合并结果未超过阈值({max_bytes} bytes)，无需压缩: {path}")
+        return
+
+    dur = _get_duration_seconds(path)
+    if not dur or dur <= 0:
+        logging.warning(f"无法读取时长，改用 CRF 迭代方案。")
+        # 无法读取时长，只能 CRF 迭代
+        tmp_out = path + ".tmp.mp4"
+        ok, new_size = _iterative_crf_keep_audio(path, tmp_out, max_bytes)
+        if ok:
+            os.replace(tmp_out, path)
+            logging.info(f"压缩完成（CRF），最终大小 {new_size/(1024**3):.2f} GB。")
+        else:
+            if os.path.exists(tmp_out):
+                os.remove(tmp_out)
+            logging.warning("CRF 迭代未能降到阈值以下，保留原文件。")
+        return
+
+    audio_kbps = _get_audio_bitrate_kbps_sum(path)
+    if audio_kbps is None:
+        logging.info("音频码率不可得，改用 CRF 迭代方案（音频copy）。")
+        tmp_out = path + ".tmp.mp4"
+        ok, new_size = _iterative_crf_keep_audio(path, tmp_out, max_bytes)
+        if ok:
+            os.replace(tmp_out, path)
+            logging.info(f"压缩完成（CRF），最终大小 {new_size/(1024**3):.2f} GB。")
+        else:
+            if os.path.exists(tmp_out):
+                os.remove(tmp_out)
+            logging.warning("CRF 迭代未能降到阈值以下，保留原文件。")
+        return
+
+    # 计算目标“总”码率，并为视频分配码率（音频copy）
+    target_bits = int(max_bytes * 8 * safety)  # 留安全余量
+    total_kbps = target_bits / dur / 1000.0
+    video_kbps = max(min_video_kbps, int(total_kbps - audio_kbps))
+    if video_kbps <= min_video_kbps:
+        logging.info("音频占比偏大，视频预算受限，可能画质较低。")
+
+    base_dir = os.path.dirname(path)
+    base_name = os.path.basename(path)
+    passlog_prefix = os.path.join(base_dir, f".2pass_{base_name}")
+    tmp_out = path + ".tmp.mp4"
+
+    # 首次两遍编码
+    try:
+        _two_pass_reencode_keep_audio(path, tmp_out, video_kbps, passlog_prefix)
+    except subprocess.CalledProcessError as e:
+        _cleanup_pass_logs(passlog_prefix)
+        logging.error(f"两遍压缩失败，改用 CRF 迭代。错误: {e}")
+        ok, new_size = _iterative_crf_keep_audio(path, tmp_out, max_bytes)
+        if ok:
+            os.replace(tmp_out, path)
+            logging.info(f"压缩完成（CRF），最终大小 {new_size/(1024**3):.2f} GB。")
+        else:
+            if os.path.exists(tmp_out):
+                os.remove(tmp_out)
+            logging.warning("CRF 迭代未能降到阈值以下，保留原文件。")
+        return
+
+    tries = 0
+    while os.path.getsize(tmp_out) > max_bytes and tries < max_retries:
+        tries += 1
+        # 每次降 15%
+        video_kbps = max(min_video_kbps, int(video_kbps * 0.85))
+        logging.info(f"仍超出上限，降低视频码率后重试({tries}/{max_retries})，新视频码率={video_kbps}k")
+        try:
+            _two_pass_reencode_keep_audio(path, tmp_out, video_kbps, passlog_prefix)
+        except subprocess.CalledProcessError as e:
+            logging.error(f"两遍压缩重试失败: {e}")
+            break
+
+    try:
+        new_size = os.path.getsize(tmp_out)
+        if new_size <= max_bytes:
+            os.replace(tmp_out, path)
+            logging.info(f"压缩完成（2-pass），最终大小 {new_size/(1024**3):.2f} GB，已替换原文件。")
+        else:
+            # 两遍仍未达标，尝试 CRF 兜底
+            logging.info("两遍压缩仍未达标，改用 CRF 兜底方案。")
+            if os.path.exists(tmp_out):
+                os.remove(tmp_out)
+            ok, new_size = _iterative_crf_keep_audio(path, tmp_out, max_bytes)
+            if ok:
+                os.replace(tmp_out, path)
+                logging.info(f"压缩完成（CRF兜底），最终大小 {new_size/(1024**3):.2f} GB。")
+            else:
+                if os.path.exists(tmp_out):
+                    os.remove(tmp_out)
+                logging.warning("CRF 兜底也未能降到阈值以下，保留原文件。")
+    except Exception as e:
+        logging.error(f"替换/清理文件出错：{e}")
+        try:
+            if os.path.exists(tmp_out):
+                os.remove(tmp_out)
+        except Exception:
+            pass
+
+# ---- 原脚本功能 ----
 
 def extract_date_from_filename(file_name):
     match = re.search(r"(\d{8})", file_name)
@@ -88,7 +319,7 @@ def merge_videos(input_folder, output_folder, delete_old_videos):
                 if current_file_date.date() == today_date:
                     logging.info(f"Skipping today's video {file_name}")
                     continue
-                if key not in exist_videos_dict and ( max_date is None or current_file_date > max_date):
+                if key not in exist_videos_dict and (max_date is None or current_file_date > max_date):
                     video_path = os.path.join(input_folder, file_name)
                     logging.info(f"Found video {file_name} with prefix {key}")
                     if key in videos_dict:
@@ -124,9 +355,10 @@ def merge_videos(input_folder, output_folder, delete_old_videos):
         os.remove(tmp_file)
         logging.info(f"Temporary file {tmp_file} deleted")
 
+        # 若超过 5GB，压缩（不动音频）
+        compress_if_needed(output_path, max_bytes=MAX_BYTES_5G)
+
     logging.info("Video merging process completed.")
-
-
 
 def merge_old_cam_videos(input_path, output_path):
     if not os.path.exists(output_path):
@@ -193,6 +425,7 @@ def merge_old_cam_videos(input_path, output_path):
             "-safe", "0",
             "-i", daily_filelist_path,  # 使用 output_path 下的文件列表
             "-c:v", "copy",
+            "-c:a", "copy",
             daily_output_file
         ]
 
@@ -203,6 +436,9 @@ def merge_old_cam_videos(input_path, output_path):
 
         # 清理临时文件
         os.remove(daily_filelist_path)
+
+        # 若超过 5GB，压缩（不动音频）
+        compress_if_needed(daily_output_file, max_bytes=MAX_BYTES_5G)
 
 def main():
     parser = argparse.ArgumentParser(description="Merge videos with the same prefix using ffmpeg.")
