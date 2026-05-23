@@ -12,7 +12,7 @@ from datetime import datetime, timedelta
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 # ---- 大小与压缩相关工具 ----
-VERSION = "4.0.2"
+VERSION = "4.0.3"
 MAX_BYTES_5G = 5 * 1024**3  # 5GB（二进制，若想十进制请改为 5_000_000_000）
 VIDEO_EXTENSIONS = (".mp4", ".avi", ".mov")
 FFMPEG_BASE_CMD = ["ffmpeg", "-hide_banner", "-loglevel", "warning", "-y"]
@@ -322,11 +322,15 @@ def extract_start_time_from_filename(file_name):
         return match.group(1)
     return None
 
-def extract_date_from_output_filename(file_name):
-    match = re.fullmatch(r"(\d{8})\.mp4", file_name)
+def extract_output_key_from_filename(file_name):
+    match = re.fullmatch(r"(\d{8}-(?:AM|PM))\.mp4", file_name)
     if match:
         return match.group(1)
     return None
+
+def extract_half_day_from_start_time(start_time):
+    hour = int(start_time[8:10])
+    return "AM" if hour < 12 else "PM"
 
 def merge_videos(input_folder, output_folder, delete_old_videos, compress):
     input_folder = os.path.abspath(input_folder)
@@ -338,25 +342,25 @@ def merge_videos(input_folder, output_folder, delete_old_videos, compress):
         os.makedirs(output_folder)
         logging.info(f"已创建输出目录: {output_folder}")
 
-    # 存储视频文件的字典，键为文件名最前面的日期，值为视频文件路径列表
+    # 存储视频文件的字典，键为 YYYYMMDD-AM/PM，值为视频文件路径列表
     videos_dict = {}
     exist_videos_dict = {}
     for file_name in os.listdir(output_folder):
         if is_video_file(file_name):  # 检查文件扩展名
-            date_prefix = extract_date_from_output_filename(file_name)
-            if date_prefix:
+            output_key = extract_output_key_from_filename(file_name)
+            if output_key:
                 video_path = os.path.join(output_folder, file_name)
-                if date_prefix in exist_videos_dict:
-                    exist_videos_dict[date_prefix].append(video_path)
+                if output_key in exist_videos_dict:
+                    exist_videos_dict[output_key].append(video_path)
                 else:
-                    exist_videos_dict[date_prefix] = [video_path]
+                    exist_videos_dict[output_key] = [video_path]
 
     # 记录输出路径中已经合并过的日期，后续只补合并缺失日期。
     max_date = None  # 用于存储最大日期的键
     for key in exist_videos_dict:
         try:
             # 尝试将键解析为日期
-            current_file_date = datetime.strptime(key, "%Y%m%d")
+            current_file_date = datetime.strptime(key[:8], "%Y%m%d")
             # 更新最大日期
             if max_date is None or current_file_date > max_date:
                 max_date = current_file_date
@@ -385,30 +389,35 @@ def merge_videos(input_folder, output_folder, delete_old_videos, compress):
                 except ValueError:
                     logging.warning(f"Invalid date format in file name: {file_name}")
 
-    # 收集需要合并的小视频列表
+    # 收集需要合并的小视频列表，按开始时间分到上午/下午。
     for file_name in os.listdir(input_folder):
         if is_video_file(file_name):  # 检查文件扩展名
-            key = extract_date_from_filename(file_name)
-            if key:
-                current_file_date = datetime.strptime(key, "%Y%m%d")
+            date_key = extract_date_from_filename(file_name)
+            start_time = extract_start_time_from_filename(file_name)
+            if date_key and start_time:
+                current_file_date = datetime.strptime(date_key, "%Y%m%d")
                 today_date = datetime.now().date()
                 if current_file_date.date() == today_date:
                     logging.info(f"跳过当天录像: {file_name}")
                     continue
-                if key not in exist_videos_dict:
+                half_day = extract_half_day_from_start_time(start_time)
+                output_key = f"{date_key}-{half_day}"
+                if output_key not in exist_videos_dict:
                     video_path = os.path.join(input_folder, file_name)
-                    if key in videos_dict:
-                        videos_dict[key].append(video_path)
+                    if output_key in videos_dict:
+                        videos_dict[output_key].append(video_path)
                     else:
-                        videos_dict[key] = [video_path]
+                        videos_dict[output_key] = [video_path]
                 else:
                     continue
+            elif date_key:
+                logging.warning(f"Skipping video without 14-digit start time: {file_name}")
 
     if not videos_dict:
         logging.info("没有需要合并的新日期。")
         return
 
-    logging.info(f"发现 {len(videos_dict)} 个待合并日期: {', '.join(sorted(videos_dict))}")
+    logging.info(f"发现 {len(videos_dict)} 个待合并时间段: {', '.join(sorted(videos_dict))}")
 
     # 对每个日期的视频列表按时间戳排序
     for key, video_paths in videos_dict.items():
