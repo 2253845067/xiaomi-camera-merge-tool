@@ -5,14 +5,81 @@ import re
 import subprocess
 import json
 import glob
+import tempfile
 from datetime import datetime, timedelta
-from collections import defaultdict
 
 # 设置日志配置为INFO级别
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 # ---- 大小与压缩相关工具 ----
+VERSION = "4.0.0"
 MAX_BYTES_5G = 5 * 1024**3  # 5GB（二进制，若想十进制请改为 5_000_000_000）
+VIDEO_EXTENSIONS = (".mp4", ".avi", ".mov")
+
+
+def default_thread_count():
+    return max(1, (os.cpu_count() or 1) // 2)
+
+
+def normalize_thread_count(thread_count):
+    if thread_count is None:
+        return default_thread_count()
+    return max(1, thread_count)
+
+
+def is_video_file(file_name):
+    return file_name.lower().endswith(VIDEO_EXTENSIONS)
+
+
+def _escape_concat_path(path):
+    normalized_path = os.path.abspath(path).replace("\\", "/")
+    return normalized_path.replace("'", "'\\''")
+
+
+def create_concat_file(video_paths, output_folder, prefix):
+    tmp_file = tempfile.NamedTemporaryFile(
+        mode="w",
+        encoding="utf-8",
+        newline="\n",
+        suffix=".txt",
+        prefix=prefix,
+        dir=output_folder,
+        delete=False,
+    )
+    try:
+        with tmp_file:
+            for video_path in video_paths:
+                tmp_file.write(f"file '{_escape_concat_path(video_path)}'\n")
+        return tmp_file.name
+    except Exception:
+        try:
+            os.remove(tmp_file.name)
+        except OSError:
+            pass
+        raise
+
+
+def create_temp_mp4(output_folder, prefix):
+    tmp_file = tempfile.NamedTemporaryFile(
+        mode="wb",
+        suffix=".mp4",
+        prefix=prefix,
+        dir=output_folder,
+        delete=False,
+    )
+    tmp_file.close()
+    return tmp_file.name
+
+
+def cleanup_file(path):
+    if not path:
+        return
+    try:
+        if os.path.exists(path):
+            os.remove(path)
+            logging.info(f"Temporary file {path} deleted")
+    except OSError as e:
+        logging.warning(f"Failed to delete temporary file {path}: {e}")
 
 def _get_duration_seconds(path):
     """用 ffprobe 读时长（秒）。"""
@@ -66,7 +133,7 @@ def _cleanup_pass_logs(log_prefix):
         except Exception:
             pass
 
-def _two_pass_reencode_keep_audio(src, dst_tmp, video_kbps, passlog_prefix):
+def _two_pass_reencode_keep_audio(src, dst_tmp, video_kbps, passlog_prefix, thread_count):
     """
     两遍编码，仅重压视频（libx264），音频不动（copy）。
     第一遍丢弃输出到空设备。
@@ -76,6 +143,7 @@ def _two_pass_reencode_keep_audio(src, dst_tmp, video_kbps, passlog_prefix):
     cmd1 = [
         "ffmpeg", "-y", "-i", src,
         "-c:v", "libx264", "-b:v", f"{video_kbps}k",
+        "-threads", str(thread_count),
         "-pass", "1", "-preset", "medium", "-an",
         "-f", "mp4", "-passlogfile", passlog_prefix, devnull
     ]
@@ -83,31 +151,32 @@ def _two_pass_reencode_keep_audio(src, dst_tmp, video_kbps, passlog_prefix):
     cmd2 = [
         "ffmpeg", "-y", "-i", src,
         "-c:v", "libx264", "-b:v", f"{video_kbps}k",
+        "-threads", str(thread_count),
         "-pass", "2", "-preset", "medium",
         "-c:a", "copy",
         "-movflags", "+faststart",
         "-passlogfile", passlog_prefix, dst_tmp
     ]
-    logging.info(f"[2-pass] 视频码率={video_kbps}k，音频copy")
+    logging.info(f"[2-pass] 视频码率={video_kbps}k，音频copy，线程={thread_count}")
     subprocess.run(cmd1, check=True)
     subprocess.run(cmd2, check=True)
     _cleanup_pass_logs(passlog_prefix)
 
-def _iterative_crf_keep_audio(src, dst_tmp, max_bytes, start_crf=23, step=2, max_crf=35):
+def _iterative_crf_keep_audio(src, dst_tmp, max_bytes, thread_count, start_crf=23, step=2, max_crf=35):
     """
     迭代 CRF，在不改动音频的情况下寻找小于 max_bytes 的体积。
     返回 (是否成功, 最终生成文件大小)
     """
     crf = start_crf
     best_size = None
-    best_path = None
 
     while crf <= max_crf:
         try:
-            logging.info(f"[CRF迭代] 尝试 CRF={crf}（音频copy）")
+            logging.info(f"[CRF迭代] 尝试 CRF={crf}（音频copy，线程={thread_count}）")
             subprocess.run([
                 "ffmpeg", "-y", "-i", src,
                 "-c:v", "libx264", "-crf", str(crf), "-preset", "medium",
+                "-threads", str(thread_count),
                 "-c:a", "copy",
                 "-movflags", "+faststart",
                 dst_tmp
@@ -125,11 +194,13 @@ def _iterative_crf_keep_audio(src, dst_tmp, max_bytes, start_crf=23, step=2, max
 
     return False, best_size if best_size is not None else 0
 
-def compress_if_needed(path, max_bytes=MAX_BYTES_5G, safety=0.95, min_video_kbps=300, max_retries=2):
+def ensure_max_size(path, max_bytes=MAX_BYTES_5G, safety=0.95, min_video_kbps=300, max_retries=2, thread_count=None):
     """
-    若文件超过 max_bytes，就在不动音频的前提下压缩：
+    确保文件不超过 max_bytes。若超过，就在不动音频的前提下压缩：
     1) 能读取音频总码率 -> 用两遍码率法精确控体积（更接近目标大小）
     2) 否则退化为 CRF 迭代（音频copy）
+
+    压缩后仍超过 max_bytes 时抛出 RuntimeError，避免留下超限文件却误认为成功。
 
     safety: 安全系数，防止容器开销导致略超
     max_retries: 2-pass 若首次仍略超，继续递减码率重试的次数
@@ -137,40 +208,40 @@ def compress_if_needed(path, max_bytes=MAX_BYTES_5G, safety=0.95, min_video_kbps
     try:
         size = os.path.getsize(path)
     except FileNotFoundError:
-        logging.error(f"文件不存在，无法压缩: {path}")
-        return
+        raise RuntimeError(f"文件不存在，无法检查大小: {path}") from None
 
     if size <= max_bytes:
         logging.info(f"合并结果未超过阈值({max_bytes} bytes)，无需压缩: {path}")
         return
 
+    thread_count = normalize_thread_count(thread_count)
     dur = _get_duration_seconds(path)
     if not dur or dur <= 0:
         logging.warning(f"无法读取时长，改用 CRF 迭代方案。")
         # 无法读取时长，只能 CRF 迭代
         tmp_out = path + ".tmp.mp4"
-        ok, new_size = _iterative_crf_keep_audio(path, tmp_out, max_bytes)
+        ok, new_size = _iterative_crf_keep_audio(path, tmp_out, max_bytes, thread_count)
         if ok:
             os.replace(tmp_out, path)
             logging.info(f"压缩完成（CRF），最终大小 {new_size/(1024**3):.2f} GB。")
         else:
             if os.path.exists(tmp_out):
                 os.remove(tmp_out)
-            logging.warning("CRF 迭代未能降到阈值以下，保留原文件。")
+            raise RuntimeError(f"CRF 迭代未能将文件压缩到 {max_bytes/(1024**3):.2f} GB 以下: {path}")
         return
 
     audio_kbps = _get_audio_bitrate_kbps_sum(path)
     if audio_kbps is None:
         logging.info("音频码率不可得，改用 CRF 迭代方案（音频copy）。")
         tmp_out = path + ".tmp.mp4"
-        ok, new_size = _iterative_crf_keep_audio(path, tmp_out, max_bytes)
+        ok, new_size = _iterative_crf_keep_audio(path, tmp_out, max_bytes, thread_count)
         if ok:
             os.replace(tmp_out, path)
             logging.info(f"压缩完成（CRF），最终大小 {new_size/(1024**3):.2f} GB。")
         else:
             if os.path.exists(tmp_out):
                 os.remove(tmp_out)
-            logging.warning("CRF 迭代未能降到阈值以下，保留原文件。")
+            raise RuntimeError(f"CRF 迭代未能将文件压缩到 {max_bytes/(1024**3):.2f} GB 以下: {path}")
         return
 
     # 计算目标“总”码率，并为视频分配码率（音频copy）
@@ -187,35 +258,40 @@ def compress_if_needed(path, max_bytes=MAX_BYTES_5G, safety=0.95, min_video_kbps
 
     # 首次两遍编码
     try:
-        _two_pass_reencode_keep_audio(path, tmp_out, video_kbps, passlog_prefix)
+        _two_pass_reencode_keep_audio(path, tmp_out, video_kbps, passlog_prefix, thread_count)
     except subprocess.CalledProcessError as e:
         _cleanup_pass_logs(passlog_prefix)
         logging.error(f"两遍压缩失败，改用 CRF 迭代。错误: {e}")
-        ok, new_size = _iterative_crf_keep_audio(path, tmp_out, max_bytes)
+        ok, new_size = _iterative_crf_keep_audio(path, tmp_out, max_bytes, thread_count)
         if ok:
             os.replace(tmp_out, path)
             logging.info(f"压缩完成（CRF），最终大小 {new_size/(1024**3):.2f} GB。")
         else:
             if os.path.exists(tmp_out):
                 os.remove(tmp_out)
-            logging.warning("CRF 迭代未能降到阈值以下，保留原文件。")
+            raise RuntimeError(f"CRF 迭代未能将文件压缩到 {max_bytes/(1024**3):.2f} GB 以下: {path}")
         return
 
     tries = 0
+    two_pass_failed = False
     while os.path.getsize(tmp_out) > max_bytes and tries < max_retries:
         tries += 1
         # 每次降 15%
         video_kbps = max(min_video_kbps, int(video_kbps * 0.85))
         logging.info(f"仍超出上限，降低视频码率后重试({tries}/{max_retries})，新视频码率={video_kbps}k")
         try:
-            _two_pass_reencode_keep_audio(path, tmp_out, video_kbps, passlog_prefix)
+            _two_pass_reencode_keep_audio(path, tmp_out, video_kbps, passlog_prefix, thread_count)
         except subprocess.CalledProcessError as e:
+            _cleanup_pass_logs(passlog_prefix)
             logging.error(f"两遍压缩重试失败: {e}")
+            two_pass_failed = True
+            if os.path.exists(tmp_out):
+                os.remove(tmp_out)
             break
 
     try:
-        new_size = os.path.getsize(tmp_out)
-        if new_size <= max_bytes:
+        new_size = os.path.getsize(tmp_out) if os.path.exists(tmp_out) else max_bytes + 1
+        if not two_pass_failed and new_size <= max_bytes:
             os.replace(tmp_out, path)
             logging.info(f"压缩完成（2-pass），最终大小 {new_size/(1024**3):.2f} GB，已替换原文件。")
         else:
@@ -223,23 +299,30 @@ def compress_if_needed(path, max_bytes=MAX_BYTES_5G, safety=0.95, min_video_kbps
             logging.info("两遍压缩仍未达标，改用 CRF 兜底方案。")
             if os.path.exists(tmp_out):
                 os.remove(tmp_out)
-            ok, new_size = _iterative_crf_keep_audio(path, tmp_out, max_bytes)
+            ok, new_size = _iterative_crf_keep_audio(path, tmp_out, max_bytes, thread_count)
             if ok:
                 os.replace(tmp_out, path)
                 logging.info(f"压缩完成（CRF兜底），最终大小 {new_size/(1024**3):.2f} GB。")
             else:
                 if os.path.exists(tmp_out):
                     os.remove(tmp_out)
-                logging.warning("CRF 兜底也未能降到阈值以下，保留原文件。")
-    except Exception as e:
-        logging.error(f"替换/清理文件出错：{e}")
+                raise RuntimeError(f"CRF 兜底也未能将文件压缩到 {max_bytes/(1024**3):.2f} GB 以下: {path}")
+    except RuntimeError:
         try:
             if os.path.exists(tmp_out):
                 os.remove(tmp_out)
         except Exception:
             pass
+        raise
+    except Exception as e:
+        try:
+            if os.path.exists(tmp_out):
+                os.remove(tmp_out)
+        except Exception:
+            pass
+        raise RuntimeError(f"压缩或清理文件出错: {e}") from e
 
-# ---- 原脚本功能 ----
+# ---- 视频合并功能 ----
 
 def extract_date_from_filename(file_name):
     match = re.search(r"(\d{8})", file_name)
@@ -253,9 +336,18 @@ def extract_start_time_from_filename(file_name):
         return match.group(1)
     return None
 
-def merge_videos(input_folder, output_folder, delete_old_videos):
-    input_folder = input_folder.encode('gbk').decode('gb2312')
+def extract_date_from_output_filename(file_name):
+    match = re.fullmatch(r"(\d{8})\.mp4", file_name)
+    if match:
+        return match.group(1)
+    return None
+
+def merge_videos(input_folder, output_folder, delete_old_videos, thread_count):
+    input_folder = os.path.abspath(input_folder)
+    output_folder = os.path.abspath(output_folder)
+    thread_count = normalize_thread_count(thread_count)
     logging.info(f"Starting video merging process..., input is {input_folder}")
+    logging.info(f"Using up to {thread_count} ffmpeg encoding thread(s).")
     # 确保输出文件夹存在
     if not os.path.exists(output_folder):
         os.makedirs(output_folder)
@@ -265,8 +357,8 @@ def merge_videos(input_folder, output_folder, delete_old_videos):
     videos_dict = {}
     exist_videos_dict = {}
     for file_name in os.listdir(output_folder):
-        if file_name.endswith(('.mp4', '.avi', '.mov')):  # 检查文件扩展名
-            date_prefix = extract_date_from_filename(file_name)
+        if is_video_file(file_name):  # 检查文件扩展名
+            date_prefix = extract_date_from_output_filename(file_name)
             if date_prefix:
                 logging.info(f"Found exist video {file_name} with date prefix {date_prefix}")
                 video_path = os.path.join(output_folder, file_name)
@@ -275,7 +367,7 @@ def merge_videos(input_folder, output_folder, delete_old_videos):
                 else:
                     exist_videos_dict[date_prefix] = [video_path]
 
-    # 从输出路径中最近的日期开始合并新的文件
+    # 记录输出路径中已经合并过的日期，后续只补合并缺失日期。
     max_date = None  # 用于存储最大日期的键
     for key in exist_videos_dict:
         try:
@@ -289,7 +381,7 @@ def merge_videos(input_folder, output_folder, delete_old_videos):
 
     if max_date:
         max_date_str = max_date.strftime("%Y%m%d")
-        print(f"最大日期是: {max_date_str}, 将从此日期后合并新视频")
+        print(f"已存在视频的最大日期是: {max_date_str}")
     else:
         print("未找到有效的日期键。")
 
@@ -297,11 +389,11 @@ def merge_videos(input_folder, output_folder, delete_old_videos):
         # 删除一周之前的视频
         weeks_ago = datetime.now() - timedelta(weeks=1)
         for file_name in os.listdir(output_folder):
-            if file_name.endswith(('.mp4', '.avi', '.mov')):
+            if is_video_file(file_name):
                 try:
-                    old_file_date = extract_date_from_filename(file_name)
-                    if old_file_date:
-                        video_date = datetime.strptime(old_file_date, "%Y%m%d")
+                    output_file_date = extract_date_from_filename(file_name)
+                    if output_file_date:
+                        video_date = datetime.strptime(output_file_date, "%Y%m%d")
                         if video_date < weeks_ago:
                             video_path = os.path.join(output_folder, file_name)
                             os.remove(video_path)
@@ -311,7 +403,7 @@ def merge_videos(input_folder, output_folder, delete_old_videos):
 
     # 收集需要合并的小视频列表
     for file_name in os.listdir(input_folder):
-        if file_name.endswith(('.mp4', '.avi', '.mov')):  # 检查文件扩展名
+        if is_video_file(file_name):  # 检查文件扩展名
             key = extract_date_from_filename(file_name)
             if key:
                 current_file_date = datetime.strptime(key, "%Y%m%d")
@@ -319,7 +411,7 @@ def merge_videos(input_folder, output_folder, delete_old_videos):
                 if current_file_date.date() == today_date:
                     logging.info(f"Skipping today's video {file_name}")
                     continue
-                if key not in exist_videos_dict and (max_date is None or current_file_date > max_date):
+                if key not in exist_videos_dict:
                     video_path = os.path.join(input_folder, file_name)
                     logging.info(f"Found video {file_name} with prefix {key}")
                     if key in videos_dict:
@@ -332,127 +424,55 @@ def merge_videos(input_folder, output_folder, delete_old_videos):
     # 对每个日期的视频列表按时间戳排序
     for key, video_paths in videos_dict.items():
         # 提取文件名中的开始时间戳并排序
-        sorted_video_paths = sorted(video_paths, key=lambda x: extract_start_time_from_filename(os.path.basename(x)))
+        valid_video_paths = []
+        for video_path in video_paths:
+            if extract_start_time_from_filename(os.path.basename(video_path)):
+                valid_video_paths.append(video_path)
+            else:
+                logging.warning(f"Skipping video without 14-digit start time: {video_path}")
+        sorted_video_paths = sorted(valid_video_paths, key=lambda x: extract_start_time_from_filename(os.path.basename(x)))
         videos_dict[key] = sorted_video_paths
         logging.info(f"Sorted video paths for date {key}: {sorted_video_paths}")
 
     # 合并视频
     for key, video_paths in videos_dict.items():
+        if not video_paths:
+            logging.warning(f"No valid videos found for date {key}, skipping merge.")
+            continue
         logging.info(f"Merging videos with prefix {key}...")
-        # 创建一个临时文件列表
-        tmp_file = os.path.join(output_folder, f"tmp_{key}.txt")
-        with open(tmp_file, 'w') as f:
-            for video_path in video_paths:
-                f.write(f"file '{video_path}'\n")
+        output_path = os.path.join(output_folder, f"{key}.mp4")
+        tmp_file = None
+        tmp_output_path = None
+        try:
+            # 创建一个临时文件列表
+            tmp_file = create_concat_file(video_paths, output_folder, f"tmp_{key}_")
+            tmp_output_path = create_temp_mp4(output_folder, f"tmp_{key}_")
 
-        # 使用ffmpeg合并视频
-        output_path = os.path.join(output_folder, f"{key}_merged.mp4")
-        cmd = f"ffmpeg -f concat -safe 0 -i {tmp_file} -c copy {output_path}"
-        subprocess.run(cmd, shell=True, check=True)
-        logging.info(f"Merged video saved to {output_path}")
+            # 使用ffmpeg合并视频
+            cmd = ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", tmp_file, "-c", "copy", tmp_output_path]
+            subprocess.run(cmd, check=True)
 
-        # 删除临时文件
-        os.remove(tmp_file)
-        logging.info(f"Temporary file {tmp_file} deleted")
-
-        # 若超过 5GB，压缩（不动音频）
-        compress_if_needed(output_path, max_bytes=MAX_BYTES_5G)
+            # 确保最终文件不超过 5GB；超出时压缩（不动音频）。
+            ensure_max_size(tmp_output_path, max_bytes=MAX_BYTES_5G, thread_count=thread_count)
+            os.replace(tmp_output_path, output_path)
+            tmp_output_path = None
+            logging.info(f"Merged video saved to {output_path}")
+        finally:
+            cleanup_file(tmp_file)
+            cleanup_file(tmp_output_path)
 
     logging.info("Video merging process completed.")
 
-def merge_old_cam_videos(input_path, output_path):
-    if not os.path.exists(output_path):
-        os.makedirs(output_path)
-
-    # 按日期分组存储视频文件
-    daily_videos = defaultdict(list)
-
-    # 获取今天的日期
-    today = datetime.now().strftime("%Y%m%d")
-
-    # 遍历输入路径中的所有文件夹
-    for folder_name in os.listdir(input_path):
-        folder_path = os.path.join(input_path, folder_name)
-
-        # 确保是文件夹
-        if os.path.isdir(folder_path):
-            try:
-                # 解析文件夹名称，提取日期和小时
-                folder_date = datetime.strptime(folder_name, "%Y%m%d%H")
-                date_str = folder_date.strftime("%Y%m%d")  # 日期字符串，用于分组
-            except ValueError:
-                # 如果文件夹名称不符合格式，跳过
-                print(f"Skipping invalid folder name: {folder_name}")
-                continue
-
-            # 跳过今天的视频
-            if date_str == today:
-                print(f"Skipping today's folder: {folder_name}")
-                continue
-
-            # 获取该文件夹内所有视频文件
-            video_files = [os.path.join(folder_path, f) for f in os.listdir(folder_path) if
-                           f.endswith(('.mp4', '.avi', '.mov'))]
-
-            # 提取时间戳并排序
-            video_files.sort(key=lambda x: int(os.path.splitext(os.path.basename(x).split('_')[-1])[0]))
-
-            if not video_files:
-                print(f"No video files found in folder: {folder_name}")
-                continue
-
-            # 将视频文件添加到对应日期的列表中
-            daily_videos[date_str].extend(video_files)
-
-    # 合并每天的视频
-    for date, video_list in daily_videos.items():
-        daily_output_file = os.path.join(output_path, f"{date}_daily_merged.mp4")
-
-        # 检查是否已经合并过
-        if os.path.exists(daily_output_file):
-            print(f"Skipping already merged file: {daily_output_file}")
-            continue
-
-        # 创建 FFmpeg 的输入文件列表
-        daily_filelist_path = os.path.join(output_path, "daily_filelist.txt")
-        with open(daily_filelist_path, "w") as filelist:
-            for video_file in video_list:
-                filelist.write(f"file '{video_file}'\n")
-
-        merge_command = [
-            "ffmpeg",
-            "-f", "concat",
-            "-safe", "0",
-            "-i", daily_filelist_path,  # 使用 output_path 下的文件列表
-            "-c:v", "copy",
-            "-c:a", "copy",
-            daily_output_file
-        ]
-
-        # 调用 FFmpeg 合并视频
-        subprocess.run(merge_command)
-
-        print(f"Merged daily video saved to: {daily_output_file}")
-
-        # 清理临时文件
-        os.remove(daily_filelist_path)
-
-        # 若超过 5GB，压缩（不动音频）
-        compress_if_needed(daily_output_file, max_bytes=MAX_BYTES_5G)
-
 def main():
     parser = argparse.ArgumentParser(description="Merge videos with the same prefix using ffmpeg.")
+    parser.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
     parser.add_argument("--input", type=str, help="Input folder path containing videos", required=True)
     parser.add_argument("--output", type=str, help="Output folder path for merged videos", required=True)
-    parser.add_argument("--delete-old-videos", action="store_true", help="Delete videos older than two weeks (default: False)")
-    parser.add_argument("--old-cam", action="store_true",help="is  (default: False)")
+    parser.add_argument("--delete-old-videos", action="store_true", help="Delete output videos older than one week (default: False)")
+    parser.add_argument("--threads", type=int, default=None, help="FFmpeg encoding threads to use (default: half of CPU cores)")
     args = parser.parse_args()
-    if args.old_cam:
-        logging.info("start merging with old camera.")
-        merge_old_cam_videos(args.input, args.output)
-    else:
-        logging.info("start merging with new camera.")
-        merge_videos(args.input, args.output, args.delete_old_videos)
+    logging.info("start merging videos.")
+    merge_videos(args.input, args.output, args.delete_old_videos, args.threads)
 
 if __name__ == "__main__":
     main()

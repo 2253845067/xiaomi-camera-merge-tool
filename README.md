@@ -1,86 +1,97 @@
 # xiaomi-camera-merge-tool
-新款小米摄像头录像文件合并工具，将十几分钟一个的小视频合并为以天为一个视频进行保存按天保存
 
-oldmi_merge_daily_ffmepg.py ：适用于以下存储格式的老款摄像头，如下：
-<img width="307" alt="截屏2025-04-11 01 09 20" src="https://github.com/user-attachments/assets/c15b10bc-2622-4d4c-bac9-b13768feeafe" />
+当前版本：`v4.0.0`
 
-merge_daily_ffmepg.py ：适用于以下存储格式的新款摄像头，如下：
-![小米摄像头文件结构](https://github.com/Mrhs121/xiaomi-camera-merge-tool/blob/main/Snipaste_2025-03-01_20-24-22.png)
+新款小米摄像头录像文件合并工具，将十几分钟一个的小视频按天合并为一个视频文件保存。
 
+> v4.0.0 起只保留新款摄像头文件结构支持，移除了老款摄像头脚本和 `--old-cam` 参数。
 
-# 必要软件
-非docker环境需要提前准备好ffmpeg以及python
+![小米摄像头文件结构](Snipaste_2025-03-01_20-24-22.png)
+
+## 功能
+
+- 按文件名中的日期自动分组，将同一天的录像合并为 `YYYYMMDD.mp4`。
+- 按文件名中的开始时间排序，适配 `00_20260516163622_20260516165427.mp4` 这类新款摄像头文件名。
+- 自动跳过当天录像，避免合并仍在写入中的文件。
+- 已存在 `YYYYMMDD.mp4` 时跳过该日期，只补合并缺失日期。
+- 最终文件硬性限制不超过 5GB；超过时自动重压视频并保留音频原样。
+- 重压视频默认只使用机器 CPU 核心数的一半，避免压缩阶段满载。
+- 可选删除 output 目录中一周前的旧视频。
+
+## 必要软件
+
+非 Docker 环境需要提前准备好 Python 和 ffmpeg。
 
 ## 原生脚本用法
-将十几分钟一个视频合并为以小时为一个视频进行保存按天保存，**（注意⚠️：每次调用该脚本不会重复产生相同的文件，只会增量更新）**
 
-```python merge_daily_ffmepg.py --input <小米摄像头录像文件夹绝对路径> --output <保存视频的绝对路径> ```
+```bash
+python all_in_one_merger.py --input <小米摄像头录像文件夹绝对路径> --output <保存视频的绝对路径>
+```
 
 举例：
 
-例如我的录像文件存储在e盘下的/movie/xiaomi_camera_videos/78DF72DE6C4E， 我想把合并好的视频文件存储在e盘下的/movie/daily，那么命令如下：
+```bash
+python all_in_one_merger.py --input /e/movie/xiaomi_camera_videos/78DF72DE6C4E --output /e/movie/daily/
+```
 
-``` python merge_daily_ffmepg.py --input /e/movie/xiaomi_camera_videos/78DF72DE6C4E --output /e/movie/daily/ ```
+查看版本：
 
-目前新款小米摄像头的文件结构基本都是下图这样子，例如我在米家app里面指定了nas（或者win的共享存储）存储路径为E盘下的movie文件夹，那么小米摄像头会在movie文件夹下创建一个xiaomi_camera_videos目录，然后再下面就是以摄像头UUID命名的目录，最下面就是一个一个的视频文件
-![小米摄像头文件结构](https://github.com/Mrhs121/xiaomi-camera-merge-tool/blob/main/Snipaste_2025-03-01_20-24-22.png)
+```bash
+python all_in_one_merger.py --version
+```
 
-合并后，将十几分钟一个的小视频合并为以天为一个视频进行保存按天保存（我是小米智能摄像头3pro，3k分辨率，每天的视频大小大约9个G）
-![合并后的文件结构](https://github.com/Mrhs121/xiaomi-camera-merge-tool/blob/main/Snipaste_2025-03-01_20-25-31.png)
+### 可选参数
 
-# Docker
-## **必要参数填写**
-以飞牛NAS举例：
+```bash
+--delete-old-videos
+```
 
-将录像文件的存储路径映射到容器的 /app/input, 将合并后的视频保存路径映射到容器的 /app/output
+删除 output 文件夹中一周前的旧文件。适合把 output 作为 SSD 临时目录，再定时冷备份到 HDD 的使用方式。
 
-![飞牛](https://github.com/Mrhs121/xiaomi-camera-merge-tool/blob/main/%E6%88%AA%E5%B1%8F2025-03-08%2013.15.05.png)
+```bash
+--threads <线程数>
+```
 
-## 3.0
-**该镜像集成了新款和老款摄像头的支持**
+限制 ffmpeg 重压视频时使用的线程数。默认不填写时使用机器 CPU 核心数的一半；例如 `--threads 2` 表示压缩时最多使用 2 个编码线程。
 
-``` docker pull shengsheng123/xiaomi-camera-merge-tool-x86:3.0 ```
-### 新款摄像头：
-默认为新款，无需填写额外的参数 \
-可选参数：```--delete-old-videos```，默认为 false ，指定后会删除 output 问价价中一周前的旧文件
+## 文件结构
 
-**推荐如下使用姿势的同学开启此参数：**
-output路径为ssd盘上的一个临时文件夹，每天定时任务再冷备份到hdd盘，这样就可以在合并的时候把ssd临时文件夹中的老文件删除了
+目前新款小米摄像头的文件结构基本如下，例如在米家 App 中指定 NAS 或 Windows 共享存储路径为 `E:\movie`，摄像头会在该目录下创建 `xiaomi_camera_videos` 目录，再按摄像头 UUID 存放录像文件。
 
-#### NAS开启此参数(飞牛举例)
-<img width="683" alt="截屏2025-04-06 21 42 16" src="https://github.com/user-attachments/assets/464b3497-aa22-4ebf-84e0-592b6136062a" />
+![小米摄像头文件结构](Snipaste_2025-03-01_20-24-22.png)
 
-### 老款摄像头：
-需要在命令中填写 ```--old-cam``` 参数
-#### NAS开启此参数(飞牛举例)
+合并后的视频会按天保存。以小米智能摄像头 3 Pro、3K 分辨率为例，每天原始视频大小大约 9GB，脚本会在需要时压缩到 5GB 以内。
 
-<img width="683" alt="截屏2025-04-06 21 42 16" src="https://github.com/Mrhs121/xiaomi-camera-merge-tool/blob/main/%E6%88%AA%E5%B1%8F2025-05-16%2011.01.16.png" />
+![合并后的文件结构](Snipaste_2025-03-01_20-25-31.png)
 
+## Docker
 
-## 2.0
-``` docker pull shengsheng123/xiaomi-camera-merge-tool-x86:2.0 ```
+将录像文件的存储路径映射到容器的 `/app/input`，将合并后的视频保存路径映射到容器的 `/app/output`。
 
-镜像新增参数 --delete-old-videos，默认为false，指定后会删除output中一周前的旧文件
+```bash
+docker pull ghcr.io/2253845067/xiaomi-camera-merge-tool:4.0.0
+```
 
-**推荐如下使用姿势的同学开启此参数：**
-output路径为ssd盘上的一个临时文件夹，每天定时任务再冷备份到hdd盘，这样就可以在合并的时候把ssd临时文件夹中的老文件删除了
-#### NAS开启此参数(飞牛举例)
-<img width="683" alt="截屏2025-04-06 21 42 16" src="https://github.com/user-attachments/assets/464b3497-aa22-4ebf-84e0-592b6136062a" />
+默认命令会运行：
 
+```bash
+python all_in_one_merger.py --input /app/input --output /app/output
+```
 
+如需启用旧文件清理，在容器启动参数中追加：
 
+```bash
+--delete-old-videos
+```
 
-## 1.0
-**目前docker镜像只适配了新款摄像头的存储格式**
-https://hub.docker.com/repository/docker/shengsheng123/xiaomi-camera-merge-tool-x86/general
+如需指定压缩线程数，可追加：
 
-```docker pull shengsheng123/xiaomi-camera-merge-tool-x86:1.0```
-## NAS(飞牛举例)
+```bash
+--threads 2
+```
+
+## NAS 示例
+
+![飞牛](截屏2025-03-08 13.15.05.png)
+
 飞牛社区博客：https://club.fnnas.com/forum.php?mod=viewthread&tid=17854
-
-将录像文件的存储路径映射到容器的 /app/input, 将合并后的视频保存路径映射到容器的 /app/output
-
-![飞牛](https://github.com/Mrhs121/xiaomi-camera-merge-tool/blob/main/%E6%88%AA%E5%B1%8F2025-03-08%2013.15.05.png)
-
-
-
