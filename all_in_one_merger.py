@@ -12,7 +12,7 @@ from datetime import datetime, timedelta
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 # ---- 大小与压缩相关工具 ----
-VERSION = "4.0.1"
+VERSION = "4.0.2"
 MAX_BYTES_5G = 5 * 1024**3  # 5GB（二进制，若想十进制请改为 5_000_000_000）
 VIDEO_EXTENSIONS = (".mp4", ".avi", ".mov")
 FFMPEG_BASE_CMD = ["ffmpeg", "-hide_banner", "-loglevel", "warning", "-y"]
@@ -328,7 +328,7 @@ def extract_date_from_output_filename(file_name):
         return match.group(1)
     return None
 
-def merge_videos(input_folder, output_folder, delete_old_videos):
+def merge_videos(input_folder, output_folder, delete_old_videos, compress):
     input_folder = os.path.abspath(input_folder)
     output_folder = os.path.abspath(output_folder)
     logging.info(f"开始合并视频，输入目录: {input_folder}")
@@ -442,8 +442,11 @@ def merge_videos(input_folder, output_folder, delete_old_videos):
             cmd = [*FFMPEG_BASE_CMD, "-f", "concat", "-safe", "0", "-i", tmp_file, "-c", "copy", tmp_output_path]
             subprocess.run(cmd, check=True)
 
-            # 确保最终文件不超过 5GB；超出时压缩（不动音频）。
-            ensure_max_size(tmp_output_path, max_bytes=MAX_BYTES_5G)
+            if compress:
+                ensure_max_size(tmp_output_path, max_bytes=MAX_BYTES_5G)
+            else:
+                merged_size = os.path.getsize(tmp_output_path)
+                logging.info(f"仅合并模式，跳过压缩检查。合并结果大小: {merged_size/(1024**3):.2f} GB。")
             os.replace(tmp_output_path, output_path)
             tmp_output_path = None
             final_size = os.path.getsize(output_path)
@@ -459,10 +462,11 @@ def main():
     parser.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
     parser.add_argument("--input", type=str, help="Input folder path containing videos", required=True)
     parser.add_argument("--output", type=str, help="Output folder path for merged videos", required=True)
+    parser.add_argument("--compress", action="store_true", help="Compress merged videos when they exceed 5GB (default: False)")
     parser.add_argument("--delete-old-videos", action="store_true", help="Delete output videos older than one week (default: False)")
     args = parser.parse_args()
     logging.info("start merging videos.")
-    merge_videos(args.input, args.output, args.delete_old_videos)
+    merge_videos(args.input, args.output, args.delete_old_videos, args.compress)
 
 if __name__ == "__main__":
     main()
