@@ -90,6 +90,6 @@ python all_in_one_merger.py --input /app/input --output /app/output
 
 ## NAS 示例
 
-![飞牛](截屏2025-03-08 13.15.05.png)
+![飞牛 NAS 示例](nas-example.png)
 
 飞牛社区博客：https://club.fnnas.com/forum.php?mod=viewthread&tid=17854
