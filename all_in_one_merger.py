@@ -12,7 +12,7 @@ from datetime import datetime, timedelta
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 # ---- 大小与压缩相关工具 ----
-VERSION = "4.0.3"
+VERSION = "4.0.4"
 MAX_BYTES_5G = 5 * 1024**3  # 5GB（二进制，若想十进制请改为 5_000_000_000）
 VIDEO_EXTENSIONS = (".mp4", ".avi", ".mov")
 FFMPEG_BASE_CMD = ["ffmpeg", "-hide_banner", "-loglevel", "warning", "-y"]
@@ -345,6 +345,7 @@ def merge_videos(input_folder, output_folder, delete_old_videos, compress):
     # 存储视频文件的字典，键为 YYYYMMDD-AM/PM，值为视频文件路径列表
     videos_dict = {}
     exist_videos_dict = {}
+    delete_before = datetime.now() - timedelta(weeks=1) if delete_old_videos else None
     for file_name in os.listdir(output_folder):
         if is_video_file(file_name):  # 检查文件扩展名
             output_key = extract_output_key_from_filename(file_name)
@@ -375,27 +376,36 @@ def merge_videos(input_folder, output_folder, delete_old_videos, compress):
 
     if delete_old_videos:
         # 删除一周之前的视频
-        weeks_ago = datetime.now() - timedelta(weeks=1)
+        deleted_old_outputs = 0
         for file_name in os.listdir(output_folder):
             if is_video_file(file_name):
                 try:
                     output_file_date = extract_date_from_filename(file_name)
                     if output_file_date:
                         video_date = datetime.strptime(output_file_date, "%Y%m%d")
-                        if video_date < weeks_ago:
+                        if video_date < delete_before:
                             video_path = os.path.join(output_folder, file_name)
                             os.remove(video_path)
-                            logging.info(f"已删除旧视频: {video_path}")
+                            deleted_old_outputs += 1
+                            output_key = extract_output_key_from_filename(file_name)
+                            if output_key:
+                                exist_videos_dict.pop(output_key, None)
                 except ValueError:
                     logging.warning(f"Invalid date format in file name: {file_name}")
+        if deleted_old_outputs:
+            logging.info(f"已删除 {deleted_old_outputs} 个一周前的输出视频。")
 
     # 收集需要合并的小视频列表，按开始时间分到上午/下午。
+    skipped_old_sources = 0
     for file_name in os.listdir(input_folder):
         if is_video_file(file_name):  # 检查文件扩展名
             date_key = extract_date_from_filename(file_name)
             start_time = extract_start_time_from_filename(file_name)
             if date_key and start_time:
                 current_file_date = datetime.strptime(date_key, "%Y%m%d")
+                if delete_before and current_file_date < delete_before:
+                    skipped_old_sources += 1
+                    continue
                 today_date = datetime.now().date()
                 if current_file_date.date() == today_date:
                     logging.info(f"跳过当天录像: {file_name}")
@@ -412,6 +422,9 @@ def merge_videos(input_folder, output_folder, delete_old_videos, compress):
                     continue
             elif date_key:
                 logging.warning(f"Skipping video without 14-digit start time: {file_name}")
+
+    if skipped_old_sources:
+        logging.info(f"已跳过 {skipped_old_sources} 个一周前的源视频，避免重新合并已删除的旧输出。")
 
     if not videos_dict:
         logging.info("没有需要合并的新日期。")
@@ -472,7 +485,7 @@ def main():
     parser.add_argument("--input", type=str, help="Input folder path containing videos", required=True)
     parser.add_argument("--output", type=str, help="Output folder path for merged videos", required=True)
     parser.add_argument("--compress", action="store_true", help="Compress merged videos when they exceed 5GB (default: False)")
-    parser.add_argument("--delete-old-videos", action="store_true", help="Delete output videos older than one week (default: False)")
+    parser.add_argument("--delete-old-videos", action="store_true", help="Delete output videos older than one week and skip old source videos (default: False)")
     args = parser.parse_args()
     logging.info("start merging videos.")
     merge_videos(args.input, args.output, args.delete_old_videos, args.compress)

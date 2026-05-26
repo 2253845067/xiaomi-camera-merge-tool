@@ -1,6 +1,6 @@
 # xiaomi-camera-merge-tool
 
-当前版本：`v4.0.3`
+当前版本：`v4.0.4`
 
 新款小米摄像头录像文件合并工具，将十几分钟一个的小视频按天分为上午、下午两个视频文件保存。
 
@@ -17,7 +17,7 @@
 - 默认只合并视频，不压缩、不限制最终文件大小。
 - 可选开启压缩模式；合并结果超过 5GB 时自动重压视频并保留音频原样。
 - ffmpeg 只显示 warning/error，脚本日志只保留关键进度。
-- 可选删除 output 目录中一周前的旧视频。
+- 可选删除 output 目录中一周前的旧视频，并跳过 input 中同样过期的源视频，避免旧输出被删除后又重新合并。
 
 ## 必要软件
 
@@ -48,7 +48,7 @@ python all_in_one_merger.py --version
 --compress
 ```
 
-删除 output 文件夹中一周前的旧文件。适合把 output 作为 SSD 临时目录，再定时冷备份到 HDD 的使用方式。
+删除 output 文件夹中一周前的旧文件。开启后也会跳过 input 文件夹中一周前的源视频，避免下次运行重新合并已清理的旧日期。适合把 output 作为 SSD 临时目录，再定时冷备份到 HDD 的使用方式。
 
 `--compress` 会开启压缩模式。开启后如果合并结果超过 5GB，脚本会自动重压视频并保留音频原样；默认不加该参数时只合并视频。
 
@@ -67,7 +67,7 @@ python all_in_one_merger.py --version
 将录像文件的存储路径映射到容器的 `/app/input`，将合并后的视频保存路径映射到容器的 `/app/output`。
 
 ```bash
-docker pull ghcr.io/2253845067/xiaomi-camera-merge-tool:4.0.3
+docker pull ghcr.io/2253845067/xiaomi-camera-merge-tool:4.0.4
 ```
 
 默认命令会运行：
